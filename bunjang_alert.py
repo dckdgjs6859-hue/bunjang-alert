@@ -10,20 +10,19 @@
     python bunjang_alert.py
 """
 
+import os
+import signal
 import json
 import time
 import random
-import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
 import requests
 
 # ================== 설정 ==================
-BRANDS = ["셔터","비헤비어","디그레",
-        
-    "스투시",            # 감시할 브랜드/검색어 (여러 개 가능)
-    "아워레가시",
+BRANDS = [
+    "셔터", "비헤비어", "디그레", "스투시", "아워레가시",   # 감시할 브랜드/검색어
 ]
 
 INCLUDE_KEYWORDS = []    # 제목에 이 단어가 있어야 알림. 예: ["후드", "자켓"] (비우면 전부)
@@ -31,11 +30,16 @@ EXCLUDE_KEYWORDS = ["구매", "삽니다", "구해요"]   # 이 단어가 있으
 MIN_PRICE = None         # 최소 가격(원). 예: 10000
 MAX_PRICE = None         # 최대 가격(원). 예: 150000
 
-CHECK_INTERVAL_MIN = 10   # 몇 분마다 확인할지
+CHECK_INTERVAL_MIN = 10  # 몇 분마다 확인할지 (내 컴퓨터에서 돌릴 때만 사용)
 
 TELEGRAM_BOT_TOKEN = ""  # @BotFather 에서 받은 토큰
 TELEGRAM_CHAT_ID = ""    # 내 chat id
 # ==========================================
+
+# 클라우드(GitHub Actions)에서는 비밀값을 환경변수로 받음
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID
+RUN_ONCE = os.environ.get("RUN_ONCE") == "1"   # 1이면 한 번만 확인하고 종료
 
 API_URL = "https://api.bunjang.co.kr/api/search/v8/mw/product/specs/keyword"
 PRODUCT_URL = "https://m.bunjang.co.kr/products/{pid}"
@@ -72,7 +76,7 @@ def to_int(v):
 
 def search(query):
     params = {"q": query, "sort": "latest"}
-    r = requests.get(API_URL, params=params, headers=HEADERS, timeout=15)
+    r = requests.get(API_URL, params=params, headers=HEADERS, timeout=(5, 10))
     r.raise_for_status()
     data = r.json()
 
@@ -145,17 +149,31 @@ def notify(brand, item):
     send_telegram(text, item["img"])
 
 
+def _give_up(signum, frame):
+    raise TimeoutError("번개장터 응답이 너무 느림 (해외 서버 접속 차단 가능성)")
+
+
 def main():
+    if RUN_ONCE and hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _give_up)
+        signal.alarm(150)   # 클라우드 1회 실행은 최대 2분 30초
     seen = load_seen()
-    log(f"번개장터 감시 시작: {', '.join(BRANDS)} / {CHECK_INTERVAL_MIN}분 간격")
-    send_telegram(f"✅ 번개장터 알림 시작: {', '.join(BRANDS)}")
+    if RUN_ONCE:
+        log(f"번개장터 1회 확인: {', '.join(BRANDS)}")
+        if not seen:   # 클라우드에서 맨 처음 실행할 때만 시작 메시지
+            send_telegram(f"✅ 번개장터 알림 시작(클라우드): {', '.join(BRANDS)}")
+    else:
+        log(f"번개장터 감시 시작: {', '.join(BRANDS)} / {CHECK_INTERVAL_MIN}분 간격")
+        send_telegram(f"✅ 번개장터 알림 시작: {', '.join(BRANDS)}")
 
     while True:
+        errors = 0
         for brand in BRANDS:
             try:
                 items = search(brand)
             except Exception as e:
                 log(f"  '{brand}' 검색 오류: {e}")
+                errors += 1
                 continue
 
             first_run = brand not in seen
@@ -175,6 +193,10 @@ def main():
             save_seen(seen)
             time.sleep(random.uniform(2, 4))
 
+        if RUN_ONCE:
+            if errors == len(BRANDS):
+                raise SystemExit("모든 브랜드 검색이 실패했습니다 (번개장터 접속 차단 가능성)")
+            return
         time.sleep(CHECK_INTERVAL_MIN * 60 + random.uniform(0, 20))
 
 
